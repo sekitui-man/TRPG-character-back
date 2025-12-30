@@ -1,25 +1,35 @@
-import jwt from "jsonwebtoken";
+import { supabase } from "./supabase.js";
 
-const jwtSecret = process.env.JWT_SECRET ?? "dev-secret";
+export const verifyAuthToken = async (token) => {
+  if (!token) return null;
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) {
+    return null;
+  }
+  return data.user;
+};
 
-export const signToken = (payload) =>
-  jwt.sign(payload, jwtSecret, { expiresIn: "7d" });
+const getBearerToken = (headers = {}) => {
+  const authHeader = headers.authorization ?? "";
+  const [scheme, token] = authHeader.split(" ");
+  if (scheme === "Bearer" && token) {
+    return token;
+  }
+  return "";
+};
 
-export const requireAuth = (req, res, next) => {
-  const header = req.headers.authorization;
-  if (!header) {
-    return res.status(401).json({ error: "missing authorization header" });
+export const requireAuth = async (req, res, next) => {
+  const accessToken = getBearerToken(req.headers);
+  if (!accessToken) {
+    return res.status(401).json({ error: "missing authorization" });
   }
 
-  const [, token] = header.split(" ");
-  if (!token) {
-    return res.status(401).json({ error: "invalid authorization header" });
+  const user = await verifyAuthToken(accessToken);
+  if (!user) {
+    return res.status(401).json({ error: "unauthorized" });
   }
 
-  try {
-    req.user = jwt.verify(token, jwtSecret);
-    return next();
-  } catch (error) {
-    return res.status(401).json({ error: "invalid token" });
-  }
+  req.user = user;
+  req.accessToken = accessToken;
+  return next();
 };
