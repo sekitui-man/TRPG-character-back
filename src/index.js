@@ -3,6 +3,7 @@ import cors from "cors";
 import express from "express";
 import http from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
+import multer from "multer";
 import { createRealtimeServer } from "./realtime.js";
 import { createUserSupabaseClient } from "./supabase.js";
 import { requireAuth, verifyAuthToken } from "./auth.js";
@@ -21,11 +22,16 @@ app.use(
     credentials: true
   })
 );
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const server = http.createServer(app);
 
 const now = () => new Date().toISOString();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }
+});
+const storageBucket = process.env.SUPABASE_STORAGE_BUCKET || "trpg-assets";
 
 const handleSupabaseError = (res, error) =>
   res.status(500).json({ error: error?.message ?? "database error" });
@@ -49,10 +55,164 @@ const ensureParticipant = async (client, sessionId, userId) => {
   return { ok: true, participant: data };
 };
 
+const fetchChatTabById = async (client, tabId) => {
+  const { data, error } = await client
+    .from("chat_tabs")
+    .select(
+      "id, session_id, name, allowed_roles, allowed_users, is_default, created_at, updated_at"
+    )
+    .eq("id", tabId)
+    .maybeSingle();
+  if (error) return { error };
+  return { data };
+};
+
+const fetchDefaultChatTab = async (client, sessionId) => {
+  const { data, error } = await client
+    .from("chat_tabs")
+    .select(
+      "id, session_id, name, allowed_roles, allowed_users, is_default, created_at, updated_at"
+    )
+    .eq("session_id", sessionId)
+    .order("is_default", { ascending: false })
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (error) return { error };
+  return { data };
+};
+
+const resolveChatTab = async (client, sessionId, tabId, participant, userId) => {
+  if (tabId) {
+    const { data, error } = await fetchChatTabById(client, tabId);
+    if (error) return { error };
+    if (!data || data.session_id !== sessionId) {
+      return { error: { message: "chat tab not found" }, status: 404 };
+    }
+    if (!userCanViewTab(data, participant, userId)) {
+      return { error: { message: "forbidden" }, status: 403 };
+    }
+    return { data };
+  }
+
+  const { data, error } = await fetchDefaultChatTab(client, sessionId);
+  if (error) return { error };
+  if (!data) {
+    return { error: { message: "chat tab not found" }, status: 404 };
+  }
+  if (!userCanViewTab(data, participant, userId)) {
+    return { error: { message: "forbidden" }, status: 403 };
+  }
+  return { data };
+};
+
+const fetchSceneSteps = async (client, sceneId) => {
+  const { data, error } = await client
+    .from("scene_steps")
+    .select("id, scene_id, place_id, pattern_id, position, created_at")
+    .eq("scene_id", sceneId)
+    .order("position", { ascending: true });
+
+  if (error) return { error };
+  return { data: data ?? [] };
+};
+
+const fetchPatternById = async (client, patternId) => {
+  if (!patternId) return { data: null };
+  const { data, error } = await client
+    .from("place_patterns")
+    .select("id, place_id, name, background_url")
+    .eq("id", patternId)
+    .maybeSingle();
+  if (error) return { error };
+  return { data };
+};
+
 const normalizeVisibility = (value) =>
   ["private", "link", "public"].includes(value) ? value : "private";
 
 const createJoinToken = () => randomBytes(16).toString("hex");
+const sanitizeFilename = (value = "upload") =>
+  value.replace(/[^a-zA-Z0-9.\-_]/g, "_").slice(0, 80) || "upload";
+const normalizeUploadCategory = (value) => {
+  const allowed = ["background", "token", "character"];
+  return allowed.includes(value) ? value : "misc";
+};
+const buildStoragePath = (userId, filename, category) => {
+  const safeCategory = normalizeUploadCategory(category);
+  return `uploads/${userId}/${safeCategory}/${randomUUID()}-${sanitizeFilename(
+    filename
+  )}`;
+};
+const normalizeAllowedRoles = (roles) => {
+  if (!Array.isArray(roles)) return [];
+  return roles
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean);
+};
+const normalizeAllowedUsers = (users) => {
+  if (!Array.isArray(users)) return [];
+  return users
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean);
+};
+const userCanViewTab = (tab, participant, userId) => {
+  if (!tab) return false;
+  const roles = tab.allowed_roles || [];
+  const users = tab.allowed_users || [];
+  if (roles.length === 0 && users.length === 0) return true;
+  if (userId && users.includes(userId)) return true;
+  if (participant?.role && roles.includes(participant.role)) return true;
+  return false;
+};
+const upsertBoardBackground = async (client, sessionId, backgroundUrl) => {
+  const { data: existing, error: existingError } = await client
+    .from("boards")
+    .select("id")
+    .eq("session_id", sessionId)
+    .maybeSingle();
+
+  if (existingError) {
+    return { error: existingError };
+  }
+
+  const updatedAt = now();
+  if (existing) {
+    const { data, error } = await client
+      .from("boards")
+      .update({
+        background_url: backgroundUrl ?? null,
+        updated_at: updatedAt
+      })
+      .eq("id", existing.id)
+      .select("id, session_id, background_url, updated_at")
+      .single();
+
+    if (error) {
+      return { error };
+    }
+    emitChange("boards", "update", data);
+    return { data };
+  }
+
+  const { data, error } = await client
+    .from("boards")
+    .insert({
+      id: randomUUID(),
+      session_id: sessionId,
+      background_url: backgroundUrl ?? null,
+      updated_at: updatedAt
+    })
+    .select("id, session_id, background_url, updated_at")
+    .single();
+
+  if (error) {
+    return { error };
+  }
+
+  emitChange("boards", "insert", data);
+  return { data };
+};
 
 const realtime = createRealtimeServer(server, {
   verifyToken: verifyAuthToken,
@@ -74,6 +234,99 @@ const emitChange = (table, action, record) => {
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
+});
+
+app.get("/me", requireAuth, async (req, res) => {
+  const client = getUserClient(req);
+  const { data: profile, error } = await client
+    .from("profiles")
+    .select("id, name, tagline, updated_at")
+    .eq("id", req.user.id)
+    .maybeSingle();
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+  if (profile) {
+    return res.json(profile);
+  }
+
+  const fallbackName =
+    req.user.user_metadata?.name || req.user.email || "Unknown";
+  const record = {
+    id: req.user.id,
+    name: fallbackName,
+    tagline: null,
+    updated_at: now()
+  };
+
+  const { data: inserted, error: insertError } = await client
+    .from("profiles")
+    .insert(record)
+    .select("id, name, tagline, updated_at")
+    .single();
+
+  if (insertError) {
+    return handleSupabaseError(res, insertError);
+  }
+
+  return res.status(201).json(inserted);
+});
+
+app.patch("/me", requireAuth, async (req, res) => {
+  const { name, tagline } = req.body ?? {};
+  if (name === undefined && tagline === undefined) {
+    return res.status(400).json({ error: "name or tagline is required" });
+  }
+
+  const client = getUserClient(req);
+  const { data: profile, error } = await client
+    .from("profiles")
+    .select("id, name, tagline, updated_at")
+    .eq("id", req.user.id)
+    .maybeSingle();
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  if (!profile) {
+    const fallbackName =
+      req.user.user_metadata?.name || req.user.email || "Unknown";
+    const record = {
+      id: req.user.id,
+      name: name ?? fallbackName,
+      tagline: tagline ?? null,
+      updated_at: now()
+    };
+    const { data: inserted, error: insertError } = await client
+      .from("profiles")
+      .insert(record)
+      .select("id, name, tagline, updated_at")
+      .single();
+
+    if (insertError) {
+      return handleSupabaseError(res, insertError);
+    }
+    return res.status(201).json(inserted);
+  }
+
+  const updates = { updated_at: now() };
+  if (name !== undefined) updates.name = name;
+  if (tagline !== undefined) updates.tagline = tagline;
+
+  const { data: updated, error: updateError } = await client
+    .from("profiles")
+    .update(updates)
+    .eq("id", req.user.id)
+    .select("id, name, tagline, updated_at")
+    .single();
+
+  if (updateError) {
+    return handleSupabaseError(res, updateError);
+  }
+
+  return res.json(updated);
 });
 
 app.post("/sessions", requireAuth, async (req, res) => {
@@ -111,6 +364,21 @@ app.post("/sessions", requireAuth, async (req, res) => {
     .insert(participant);
   if (participantError) {
     return handleSupabaseError(res, participantError);
+  }
+
+  const { error: tabError } = await client.from("chat_tabs").insert({
+    id: randomUUID(),
+    session_id: record.id,
+    name: "全体",
+    allowed_roles: null,
+    allowed_users: null,
+    is_default: true,
+    created_by: req.user.id,
+    created_at: now(),
+    updated_at: now()
+  });
+  if (tabError) {
+    return handleSupabaseError(res, tabError);
   }
 
   emitChange("sessions", "insert", {
@@ -268,6 +536,218 @@ app.post("/sessions/:sessionId/participants", requireAuth, async (req, res) => {
   return res.status(201).json({ user_id: userId });
 });
 
+app.get("/sessions/:sessionId/participants", requireAuth, async (req, res) => {
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+
+  const { data, error } = await client
+    .from("session_participants")
+    .select("id, session_id, user_id, role, created_at")
+    .eq("session_id", req.params.sessionId)
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.json(data ?? []);
+});
+
+app.get("/sessions/:sessionId/chat-tabs", requireAuth, async (req, res) => {
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+
+  const { data, error } = await client
+    .from("chat_tabs")
+    .select(
+      "id, session_id, name, allowed_roles, allowed_users, is_default, created_at, updated_at"
+    )
+    .eq("session_id", req.params.sessionId)
+    .order("is_default", { ascending: false })
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.json(data ?? []);
+});
+
+app.post("/sessions/:sessionId/chat-tabs", requireAuth, async (req, res) => {
+  const { name, allowed_roles: allowedRoles, allowed_users: allowedUsers } =
+    req.body ?? {};
+  if (!name) {
+    return res.status(400).json({ error: "name is required" });
+  }
+
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+  if (membership.participant.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  const roles = normalizeAllowedRoles(allowedRoles);
+  const users = normalizeAllowedUsers(allowedUsers);
+  const record = {
+    id: randomUUID(),
+    session_id: req.params.sessionId,
+    name,
+    allowed_roles: roles.length ? roles : null,
+    allowed_users: users.length ? users : null,
+    is_default: false,
+    created_by: req.user.id,
+    created_at: now(),
+    updated_at: now()
+  };
+
+  const { data, error } = await client
+    .from("chat_tabs")
+    .insert(record)
+    .select(
+      "id, session_id, name, allowed_roles, allowed_users, is_default, created_at, updated_at"
+    )
+    .single();
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.status(201).json(data);
+});
+
+app.patch("/chat-tabs/:tabId", requireAuth, async (req, res) => {
+  const { name, allowed_roles: allowedRoles, allowed_users: allowedUsers } =
+    req.body ?? {};
+  const client = getUserClient(req);
+  const { data: tab, error: tabError } = await client
+    .from("chat_tabs")
+    .select("id, session_id, is_default")
+    .eq("id", req.params.tabId)
+    .maybeSingle();
+
+  if (tabError) {
+    return handleSupabaseError(res, tabError);
+  }
+  if (!tab) {
+    return res.status(404).json({ error: "chat tab not found" });
+  }
+
+  const membership = await ensureParticipant(
+    client,
+    tab.session_id,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+  if (membership.participant.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  const roles = normalizeAllowedRoles(allowedRoles);
+  const users = normalizeAllowedUsers(allowedUsers);
+  const updates = {
+    updated_at: now()
+  };
+  if (name !== undefined) updates.name = name;
+  if (allowedRoles !== undefined) {
+    updates.allowed_roles = roles.length ? roles : null;
+  }
+  if (allowedUsers !== undefined) {
+    updates.allowed_users = users.length ? users : null;
+  }
+
+  const { data, error } = await client
+    .from("chat_tabs")
+    .update(updates)
+    .eq("id", tab.id)
+    .select(
+      "id, session_id, name, allowed_roles, allowed_users, is_default, created_at, updated_at"
+    )
+    .single();
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.json(data);
+});
+
+app.delete("/chat-tabs/:tabId", requireAuth, async (req, res) => {
+  const client = getUserClient(req);
+  const { data: tab, error: tabError } = await client
+    .from("chat_tabs")
+    .select("id, session_id, is_default")
+    .eq("id", req.params.tabId)
+    .maybeSingle();
+
+  if (tabError) {
+    return handleSupabaseError(res, tabError);
+  }
+  if (!tab) {
+    return res.status(404).json({ error: "chat tab not found" });
+  }
+
+  if (tab.is_default) {
+    return res.status(400).json({ error: "default tab cannot be deleted" });
+  }
+
+  const membership = await ensureParticipant(
+    client,
+    tab.session_id,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+  if (membership.participant.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  const { error } = await client.from("chat_tabs").delete().eq("id", tab.id);
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.status(204).end();
+});
+
 app.get("/sessions/:sessionId/board", requireAuth, async (req, res) => {
   const client = getUserClient(req);
   const membership = await ensureParticipant(
@@ -292,7 +772,7 @@ app.get("/sessions/:sessionId/board", requireAuth, async (req, res) => {
     return handleSupabaseError(res, error);
   }
   if (!data) {
-    return res.status(404).json({ error: "board not found" });
+    return res.status(204).end();
   }
   return res.json(data);
 });
@@ -424,6 +904,644 @@ app.post("/sessions/:sessionId/tokens", requireAuth, async (req, res) => {
 
   emitChange("tokens", "insert", record);
   return res.status(201).json(record);
+});
+
+app.get("/sessions/:sessionId/logs", requireAuth, async (req, res) => {
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+
+  const tabId = typeof req.query?.tab_id === "string" ? req.query.tab_id : "";
+  const resolvedTab = await resolveChatTab(
+    client,
+    req.params.sessionId,
+    tabId || null,
+    membership.participant,
+    req.user.id
+  );
+  if (resolvedTab?.error) {
+    if (resolvedTab.status === 404) {
+      return res.status(404).json({ error: "chat tab not found" });
+    }
+    if (resolvedTab.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, resolvedTab.error);
+  }
+
+  const { data, error } = await client
+    .from("session_logs")
+    .select(
+      "id, session_id, tab_id, user_id, message, message_type, speaker_type, speaker_name, speaker_color, message_font, dice_result, created_at"
+    )
+    .eq("session_id", req.params.sessionId)
+    .eq("tab_id", resolvedTab.data?.id ?? null)
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.json(data ?? []);
+});
+
+app.post("/sessions/:sessionId/chat", requireAuth, async (req, res) => {
+  const {
+    message,
+    message_type: messageType,
+    speaker_type: speakerType,
+    speaker_name: speakerName,
+    speaker_color: speakerColor,
+    message_font: messageFont,
+    dice_result: diceResult,
+    tab_id: tabId
+  } = req.body ?? {};
+  if (!message) {
+    return res.status(400).json({ error: "message is required" });
+  }
+
+  const normalizedMessageType = messageType === "dice" ? "dice" : "chat";
+  const allowedSpeakers = ["account", "character", "custom", "kp"];
+  const normalizedSpeakerType = allowedSpeakers.includes(speakerType)
+    ? speakerType
+    : "account";
+
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+
+  const resolvedTab = await resolveChatTab(
+    client,
+    req.params.sessionId,
+    tabId || null,
+    membership.participant,
+    req.user.id
+  );
+  if (resolvedTab?.error) {
+    if (resolvedTab.status === 404) {
+      return res.status(404).json({ error: "chat tab not found" });
+    }
+    if (resolvedTab.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, resolvedTab.error);
+  }
+
+  const record = {
+    id: randomUUID(),
+    session_id: req.params.sessionId,
+    tab_id: resolvedTab.data?.id ?? null,
+    user_id: req.user.id,
+    message,
+    message_type: normalizedMessageType,
+    speaker_type: normalizedSpeakerType,
+    speaker_name: speakerName ?? null,
+    speaker_color: speakerColor ?? null,
+    message_font: messageFont ?? null,
+    dice_result: diceResult ?? null,
+    created_at: now()
+  };
+
+  const { data, error } = await client
+    .from("session_logs")
+    .insert(record)
+    .select(
+      "id, session_id, tab_id, user_id, message, message_type, speaker_type, speaker_name, speaker_color, message_font, dice_result, created_at"
+    )
+    .single();
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  emitChange("session_logs", "insert", data);
+  return res.status(201).json(data);
+});
+
+app.get("/sessions/:sessionId/places", requireAuth, async (req, res) => {
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+
+  const { data, error } = await client
+    .from("places")
+    .select(
+      "id, session_id, name, created_at, updated_at, place_patterns (id, name, background_url, created_at)"
+    )
+    .eq("session_id", req.params.sessionId)
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.json(data ?? []);
+});
+
+app.post("/sessions/:sessionId/places", requireAuth, async (req, res) => {
+  const { name } = req.body ?? {};
+  if (!name) {
+    return res.status(400).json({ error: "name is required" });
+  }
+
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+  if (membership.participant.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  const record = {
+    id: randomUUID(),
+    session_id: req.params.sessionId,
+    name,
+    created_by: req.user.id,
+    created_at: now(),
+    updated_at: now()
+  };
+
+  const { data, error } = await client
+    .from("places")
+    .insert(record)
+    .select("id, session_id, name, created_at, updated_at")
+    .single();
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.status(201).json(data);
+});
+
+app.post("/places/:placeId/patterns", requireAuth, async (req, res) => {
+  const { name, background_url: backgroundUrl } = req.body ?? {};
+  if (!name) {
+    return res.status(400).json({ error: "name is required" });
+  }
+
+  const client = getUserClient(req);
+  const { data: place, error: placeError } = await client
+    .from("places")
+    .select("id, session_id")
+    .eq("id", req.params.placeId)
+    .maybeSingle();
+
+  if (placeError) {
+    return handleSupabaseError(res, placeError);
+  }
+  if (!place) {
+    return res.status(404).json({ error: "place not found" });
+  }
+
+  const membership = await ensureParticipant(client, place.session_id, req.user.id);
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+  if (membership.participant.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  const record = {
+    id: randomUUID(),
+    place_id: place.id,
+    name,
+    background_url: backgroundUrl ?? null,
+    created_at: now()
+  };
+
+  const { data, error } = await client
+    .from("place_patterns")
+    .insert(record)
+    .select("id, place_id, name, background_url, created_at")
+    .single();
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.status(201).json(data);
+});
+
+app.get("/sessions/:sessionId/scenes", requireAuth, async (req, res) => {
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+
+  const { data, error } = await client
+    .from("scenes")
+    .select(
+      "id, session_id, name, created_at, updated_at, scene_steps (id, position, place_id, pattern_id, created_at)"
+    )
+    .eq("session_id", req.params.sessionId)
+    .order("created_at", { ascending: true })
+    .order("position", { foreignTable: "scene_steps", ascending: true });
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.json(data ?? []);
+});
+
+app.post("/sessions/:sessionId/scenes", requireAuth, async (req, res) => {
+  const { name } = req.body ?? {};
+  if (!name) {
+    return res.status(400).json({ error: "name is required" });
+  }
+
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+  if (membership.participant.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  const record = {
+    id: randomUUID(),
+    session_id: req.params.sessionId,
+    name,
+    created_by: req.user.id,
+    created_at: now(),
+    updated_at: now()
+  };
+
+  const { data, error } = await client
+    .from("scenes")
+    .insert(record)
+    .select("id, session_id, name, created_at, updated_at")
+    .single();
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.status(201).json(data);
+});
+
+app.post("/scenes/:sceneId/steps", requireAuth, async (req, res) => {
+  const { place_id: placeId, pattern_id: patternId } = req.body ?? {};
+  if (!placeId || !patternId) {
+    return res.status(400).json({ error: "place_id and pattern_id are required" });
+  }
+
+  const client = getUserClient(req);
+  const { data: scene, error: sceneError } = await client
+    .from("scenes")
+    .select("id, session_id")
+    .eq("id", req.params.sceneId)
+    .maybeSingle();
+
+  if (sceneError) {
+    return handleSupabaseError(res, sceneError);
+  }
+  if (!scene) {
+    return res.status(404).json({ error: "scene not found" });
+  }
+
+  const membership = await ensureParticipant(client, scene.session_id, req.user.id);
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+  if (membership.participant.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  const { data: place, error: placeError } = await client
+    .from("places")
+    .select("id, session_id")
+    .eq("id", placeId)
+    .maybeSingle();
+
+  if (placeError) {
+    return handleSupabaseError(res, placeError);
+  }
+  if (!place || place.session_id !== scene.session_id) {
+    return res.status(400).json({ error: "invalid place" });
+  }
+
+  const { data: pattern, error: patternError } = await client
+    .from("place_patterns")
+    .select("id, place_id")
+    .eq("id", patternId)
+    .maybeSingle();
+
+  if (patternError) {
+    return handleSupabaseError(res, patternError);
+  }
+  if (!pattern || pattern.place_id !== placeId) {
+    return res.status(400).json({ error: "invalid pattern" });
+  }
+
+  const { data: lastStep, error: lastStepError } = await client
+    .from("scene_steps")
+    .select("position")
+    .eq("scene_id", scene.id)
+    .order("position", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (lastStepError) {
+    return handleSupabaseError(res, lastStepError);
+  }
+
+  const position = lastStep ? lastStep.position + 1 : 0;
+  const record = {
+    id: randomUUID(),
+    scene_id: scene.id,
+    place_id: placeId,
+    pattern_id: patternId,
+    position,
+    created_at: now()
+  };
+
+  const { data, error } = await client
+    .from("scene_steps")
+    .insert(record)
+    .select("id, scene_id, place_id, pattern_id, position, created_at")
+    .single();
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.status(201).json(data);
+});
+
+app.get("/sessions/:sessionId/scene-state", requireAuth, async (req, res) => {
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+
+  const { data: state, error: stateError } = await client
+    .from("scene_states")
+    .select("session_id, scene_id, step_index, updated_at")
+    .eq("session_id", req.params.sessionId)
+    .maybeSingle();
+
+  if (stateError) {
+    return handleSupabaseError(res, stateError);
+  }
+
+  if (!state || !state.scene_id) {
+    return res.json({ state: state ?? null, step: null });
+  }
+
+  const { data: steps, error: stepsError } = await fetchSceneSteps(
+    client,
+    state.scene_id
+  );
+  if (stepsError) {
+    return handleSupabaseError(res, stepsError);
+  }
+  if (!steps.length) {
+    return res.json({ state, step: null });
+  }
+
+  const index = Math.min(Math.max(state.step_index, 0), steps.length - 1);
+  const step = steps[index];
+  const { data: pattern, error: patternError } = await fetchPatternById(
+    client,
+    step.pattern_id
+  );
+  if (patternError) {
+    return handleSupabaseError(res, patternError);
+  }
+
+  return res.json({
+    state,
+    step: {
+      ...step,
+      background_url: pattern?.background_url ?? null
+    }
+  });
+});
+
+app.post("/sessions/:sessionId/scene-state", requireAuth, async (req, res) => {
+  const { scene_id: sceneId } = req.body ?? {};
+  if (!sceneId) {
+    return res.status(400).json({ error: "scene_id is required" });
+  }
+
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+  if (membership.participant.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  const { data: scene, error: sceneError } = await client
+    .from("scenes")
+    .select("id, session_id")
+    .eq("id", sceneId)
+    .maybeSingle();
+
+  if (sceneError) {
+    return handleSupabaseError(res, sceneError);
+  }
+  if (!scene || scene.session_id !== req.params.sessionId) {
+    return res.status(404).json({ error: "scene not found" });
+  }
+
+  const { data: steps, error: stepsError } = await fetchSceneSteps(
+    client,
+    scene.id
+  );
+  if (stepsError) {
+    return handleSupabaseError(res, stepsError);
+  }
+  if (!steps.length) {
+    return res.status(400).json({ error: "scene has no steps" });
+  }
+
+  const { data: pattern, error: patternError } = await fetchPatternById(
+    client,
+    steps[0].pattern_id
+  );
+  if (patternError) {
+    return handleSupabaseError(res, patternError);
+  }
+
+  const updatedAt = now();
+  const { data: state, error: stateError } = await client
+    .from("scene_states")
+    .upsert({
+      session_id: req.params.sessionId,
+      scene_id: scene.id,
+      step_index: 0,
+      updated_at: updatedAt
+    })
+    .select("session_id, scene_id, step_index, updated_at")
+    .single();
+
+  if (stateError) {
+    return handleSupabaseError(res, stateError);
+  }
+
+  const { error: boardError } = await upsertBoardBackground(
+    client,
+    req.params.sessionId,
+    pattern?.background_url ?? null
+  );
+  if (boardError) {
+    return handleSupabaseError(res, boardError);
+  }
+
+  return res.json({ state, step: steps[0] });
+});
+
+app.post("/sessions/:sessionId/scene-next", requireAuth, async (req, res) => {
+  const client = getUserClient(req);
+  const membership = await ensureParticipant(
+    client,
+    req.params.sessionId,
+    req.user.id
+  );
+  if (!membership.ok) {
+    if (membership.status === 403) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    return handleSupabaseError(res, membership.error);
+  }
+  if (membership.participant.role !== "owner") {
+    return res.status(403).json({ error: "forbidden" });
+  }
+
+  const { data: state, error: stateError } = await client
+    .from("scene_states")
+    .select("session_id, scene_id, step_index, updated_at")
+    .eq("session_id", req.params.sessionId)
+    .maybeSingle();
+
+  if (stateError) {
+    return handleSupabaseError(res, stateError);
+  }
+  if (!state || !state.scene_id) {
+    return res.status(404).json({ error: "scene state not found" });
+  }
+
+  const { data: steps, error: stepsError } = await fetchSceneSteps(
+    client,
+    state.scene_id
+  );
+  if (stepsError) {
+    return handleSupabaseError(res, stepsError);
+  }
+  if (!steps.length) {
+    return res.status(400).json({ error: "scene has no steps" });
+  }
+
+  const nextIndex = (state.step_index + 1) % steps.length;
+  const nextStep = steps[nextIndex];
+  const { data: pattern, error: patternError } = await fetchPatternById(
+    client,
+    nextStep.pattern_id
+  );
+  if (patternError) {
+    return handleSupabaseError(res, patternError);
+  }
+
+  const { data: updatedState, error: updateError } = await client
+    .from("scene_states")
+    .update({
+      step_index: nextIndex,
+      updated_at: now()
+    })
+    .eq("session_id", req.params.sessionId)
+    .select("session_id, scene_id, step_index, updated_at")
+    .single();
+
+  if (updateError) {
+    return handleSupabaseError(res, updateError);
+  }
+
+  const { error: boardError } = await upsertBoardBackground(
+    client,
+    req.params.sessionId,
+    pattern?.background_url ?? null
+  );
+  if (boardError) {
+    return handleSupabaseError(res, boardError);
+  }
+
+  return res.json({ state: updatedState, step: nextStep });
 });
 
 app.patch("/tokens/:tokenId", requireAuth, async (req, res) => {
@@ -629,6 +1747,85 @@ app.delete("/characters/:characterId", requireAuth, async (req, res) => {
     return handleSupabaseError(res, error);
   }
   return res.status(204).end();
+});
+
+app.post("/uploads", requireAuth, upload.single("file"), async (req, res) => {
+  const client = getUserClient(req);
+  const file = req.file;
+  let assetUrl = req.body?.url || null;
+  let assetName = req.body?.name || null;
+  const category = normalizeUploadCategory(req.body?.category);
+
+  if (file) {
+    const storagePath = buildStoragePath(
+      req.user.id,
+      file.originalname || "upload",
+      category
+    );
+    const { error: uploadError } = await client.storage
+      .from(storageBucket)
+      .upload(storagePath, file.buffer, {
+        contentType: file.mimetype,
+        upsert: false
+      });
+
+    if (uploadError) {
+      return handleSupabaseError(res, uploadError);
+    }
+
+    const { data: publicData } = client.storage
+      .from(storageBucket)
+      .getPublicUrl(storagePath);
+    assetUrl = publicData?.publicUrl || null;
+    assetName = file.originalname || assetName || null;
+  }
+
+  if (!assetUrl) {
+    return res.status(400).json({ error: "file or url is required" });
+  }
+
+  const record = {
+    id: randomUUID(),
+    user_id: req.user.id,
+    name: assetName,
+    url: assetUrl,
+    category,
+    created_at: now()
+  };
+
+  const { data, error } = await client
+    .from("uploads")
+    .insert(record)
+    .select("id, user_id, name, url, category, created_at")
+    .single();
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.status(201).json(data);
+});
+
+app.get("/uploads", requireAuth, async (req, res) => {
+  const client = getUserClient(req);
+  const category = req.query?.category;
+  let query = client
+    .from("uploads")
+    .select("id, name, url, category, created_at")
+    .eq("user_id", req.user.id)
+    .order("created_at", { ascending: false });
+
+  if (category) {
+    query = query.eq("category", normalizeUploadCategory(category));
+  }
+
+  const { data, error } = await query;
+
+  if (error) {
+    return handleSupabaseError(res, error);
+  }
+
+  return res.json(data ?? []);
 });
 
 const port = Number(process.env.PORT ?? 3000);
