@@ -1,0 +1,2 @@
+export const handleSupabaseError = (res, error) =>
+  res.status(500).json({ error: error?.message ?? "database error" });
