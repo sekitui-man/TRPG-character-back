@@ -349,6 +349,9 @@ drop policy if exists "participants self join public or link" on session_partici
 
 Discord ユーザーIDと Supabase ユーザーIDの対応を扱います。
 
+- `POST /bot/users/provision`
+  - ボディ: `{ "discord_user_id": "<discord_id>" }`
+  - リンク未作成なら Supabase Auth ユーザー発行 + 連携作成を行います。
 - `GET /bot/users/resolve`
   - クエリ: `discord_user_id=<discord_id>` または `user_id=<supabase_user_id>`
 - `PUT /bot/users/resolve`
@@ -362,7 +365,9 @@ Discord ユーザーIDと Supabase ユーザーIDの対応を扱います。
 - `POST /me/discord-link/sync`
 
 `/me/discord-link/sync` は Supabase Auth ユーザー情報の Discord identity から
-`discord_user_id` を抽出して保存します。
+`discord_user_id` を抽出して保存します。既存リンクの所有者が異なる場合は、
+キャラクター関連データ（`characters` / `character_sheets_coc6`）の所有者を
+現在ユーザーに移管してから更新します。
 
 ## リアルタイム通知
 

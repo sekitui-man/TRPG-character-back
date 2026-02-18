@@ -26,6 +26,32 @@ Bot向けエンドポイント（`/bot/*`）は次のどちらかで認証しま
 ## Endpoints
 
 ## 1) Resolve User Link
+### `POST /bot/users/provision`
+Request body:
+```json
+{
+  "discord_user_id": "123456789012345678"
+}
+```
+
+Behavior:
+- 既存リンクがあれば再利用（`created: false`）
+- 未作成なら Supabase Auth ユーザーを新規発行し、リンクを作成（`created: true`）
+
+Response `200` or `201`:
+```json
+{
+  "discord_user_id": "123456789012345678",
+  "user_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+  "created_at": "2026-02-18T00:00:00Z",
+  "updated_at": "2026-02-18T00:00:00Z",
+  "created": true
+}
+```
+
+Errors:
+- `400 {"error":"valid discord_user_id is required"}`
+
 ### `GET /bot/users/resolve`
 - Query: `discord_user_id` または `user_id`（どちらか必須）
 - `discord_user_id` がある場合はそれを優先して検索します。
@@ -115,3 +141,5 @@ Bot用ではないですが、連携状態確認に利用できます。
 ### `POST /me/discord-link/sync`
 - 認証: Supabase access token
 - Supabase AuthのDiscord identityから `discord_user_id` を抽出し、連携を保存
+- 既存リンクの `user_id` が現在ユーザーと異なる場合、
+  `characters` と `character_sheets_coc6` の所有者を現在ユーザーへ移管
