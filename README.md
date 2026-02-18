@@ -16,7 +16,9 @@ npm run start
 | `PORT` | HTTP ポート | `3000` |
 | `SUPABASE_URL` | Supabase Project URL | - |
 | `SUPABASE_ANON_KEY` | Supabase anon key | - |
+| `SUPABASE_SERVICE_ROLE_KEY` | Bot API が参照用に使う service role key | - |
 | `CORS_ORIGIN` | 許可するフロントURL（カンマ区切り） | `http://localhost:5173` |
+| `BOT_API_KEYS` | Bot API 認証キー（カンマ区切りで複数指定可） | - |
 
 ## Supabase セットアップ
 
@@ -298,7 +300,7 @@ drop policy if exists "participants self join public or link" on session_partici
 ## 認証
 
 ログインはフロントエンドの Supabase Auth で行い、API には `Authorization: Bearer <access_token>` を付けて呼び出します。
-`/health` 以外の API はログイン必須です。
+`/health` と `/bot/*` を除く API はログイン必須です。
 
 ## REST API
 
@@ -331,6 +333,36 @@ drop policy if exists "participants self join public or link" on session_partici
 - `POST /characters`
 - `PATCH /characters/:characterId`
 - `DELETE /characters/:characterId`
+
+### Bot Characters (Bot API key 必須)
+
+以下は Discord Bot などサーバ間連携向けです。`Authorization: Bearer <BOT_API_KEY>` または `x-bot-key` ヘッダーを指定してください。
+
+- `GET /bot/users/:userId/characters`
+  - クエリ: `include_sheet=true|false`, `include_private_sheet=true|false`, `limit=1..100`
+- `GET /bot/characters/:characterId`
+  - クエリ: `include_sheet=true|false`, `include_private_sheet=true|false`, `user_id=<owner_user_id>`
+
+`include_private_sheet=false`（デフォルト）の場合、`character_sheets_coc6.visibility='public'` のシートのみ返します。
+
+### Bot User Resolve (Bot API key 必須)
+
+Discord ユーザーIDと Supabase ユーザーIDの対応を扱います。
+
+- `GET /bot/users/resolve`
+  - クエリ: `discord_user_id=<discord_id>` または `user_id=<supabase_user_id>`
+- `PUT /bot/users/resolve`
+  - ボディ: `{ "discord_user_id": "...", "user_id": "..." }`
+
+### My Discord Link (要認証)
+
+ログイン中ユーザーの Discord 連携情報を確認/同期します。
+
+- `GET /me/discord-link`
+- `POST /me/discord-link/sync`
+
+`/me/discord-link/sync` は Supabase Auth ユーザー情報の Discord identity から
+`discord_user_id` を抽出して保存します。
 
 ## リアルタイム通知
 
