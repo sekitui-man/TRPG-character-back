@@ -92,41 +92,59 @@ Errors:
 ## 2) List Characters By Supabase User
 ### `GET /bot/users/:userId/characters`
 Query:
-- `include_sheet` (`true`/`1` で有効, default: `false`)
+- `include_sheet` （互換用。現在は返却形式に影響しません）
 - `include_private_sheet` (`true`/`1` で有効, default: `false`)
 - `limit` (`1..100`, default: `50`)
 
-Response `200` (without sheet):
+Response `200`:
 ```json
 [
   {
-    "id": "char-id",
-    "name": "Alice",
-    "system": "coc6",
-    "level": null,
-    "background": null,
-    "notes": null,
-    "image_url": null,
-    "user_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-    "created_at": "2026-02-18T00:00:00Z"
+    "kind": "character",
+    "data": {
+      "name": "『アリス』",
+      "initiative": 14,
+      "externalUrl": "https://iachara.com/view/8934795",
+      "iconUrl": "https://example.com/icon.png",
+      "commands": "CCB<=65 【アイデア】",
+      "status": [
+        { "label": "HP", "value": 13, "max": 13 },
+        { "label": "MP", "value": 17, "max": 17 },
+        { "label": "SAN", "value": 75, "max": 75 }
+      ],
+      "params": [
+        { "label": "STR", "value": "13" },
+        { "label": "CON", "value": "14" },
+        { "label": "POW", "value": "17" }
+      ]
+    },
+    "meta": {
+      "character_id": "char-id",
+      "user_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "system": "coc6",
+      "created_at": "2026-02-18T00:00:00Z",
+      "has_sheet": true,
+      "sheet_visibility": "public",
+      "sheet_updated_at": "2026-02-18T00:00:00Z"
+    }
   }
 ]
 ```
 
-Response `200` (with `include_sheet=true`):
-- 各要素に `coc6_sheet` を追加します。
-- `character_sheets_coc6` が未作成の場合も `coc6_sheet: null` を返します。
+補足:
+- `character_sheets_coc6` が無い/非公開の場合でも、`meta.has_sheet=false` で返します。
+- `params` は標準8能力値（STR, CON, POW, DEX, APP, SIZ, INT, EDU）に加えて拡張項目を含められます。
+- `status` は標準3項目（HP, MP, SAN）に加えて拡張項目を含められます。
 
 ## 3) Get Character By ID
 ### `GET /bot/characters/:characterId`
 Query:
-- `include_sheet` (`true`/`1` で有効, default: `false`)
+- `include_sheet` （互換用。現在は返却形式に影響しません）
 - `include_private_sheet` (`true`/`1` で有効, default: `false`)
 - `user_id`（指定時は所有者チェック。違う場合 `404`）
 
 Response `200`:
-- キャラ単体オブジェクト
-- `include_sheet=true` の場合 `coc6_sheet` を含む
+- `List Characters` の単体版と同じ `typed character` 構造
 
 Errors:
 - `404 {"error":"character not found"}`

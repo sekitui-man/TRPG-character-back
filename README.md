@@ -339,11 +339,12 @@ drop policy if exists "participants self join public or link" on session_partici
 以下は Discord Bot などサーバ間連携向けです。`Authorization: Bearer <BOT_API_KEY>` または `x-bot-key` ヘッダーを指定してください。
 
 - `GET /bot/users/:userId/characters`
-  - クエリ: `include_sheet=true|false`, `include_private_sheet=true|false`, `limit=1..100`
+  - クエリ: `include_sheet=true|false`（互換用）, `include_private_sheet=true|false`, `limit=1..100`
 - `GET /bot/characters/:characterId`
-  - クエリ: `include_sheet=true|false`, `include_private_sheet=true|false`, `user_id=<owner_user_id>`
+  - クエリ: `include_sheet=true|false`（互換用）, `include_private_sheet=true|false`, `user_id=<owner_user_id>`
 
-`include_private_sheet=false`（デフォルト）の場合、`character_sheets_coc6.visibility='public'` のシートのみ返します。
+返却は `typed character` 形式（`kind: "character"`）です。`data` に `name/initiative/externalUrl/iconUrl/commands/status/params` を持ち、`meta` に `character_id/system/user_id` などを持ちます。
+`include_private_sheet=false`（デフォルト）の場合、`character_sheets_coc6.visibility='public'` のシートのみ参照します。
 
 ### Bot User Resolve (Bot API key 必須)
 

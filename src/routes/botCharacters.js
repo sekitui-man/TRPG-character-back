@@ -1,5 +1,6 @@
 import { requireBotAuth } from "../auth.js";
 import { COC6_SHEET_FIELDS } from "../lib/constants.js";
+import { buildTypedCharacter } from "../lib/coc6TypedCharacter.js";
 import { getServiceSupabaseClient } from "../supabase.js";
 import { handleSupabaseError } from "../services/errors.js";
 
@@ -69,7 +70,6 @@ export const registerBotCharacterRoutes = (app) => {
       return;
     }
 
-    const includeSheet = parseBoolean(req.query.include_sheet);
     const includePrivateSheet = parseBoolean(req.query.include_private_sheet);
     const limit = parseListLimit(req.query.limit);
 
@@ -83,9 +83,6 @@ export const registerBotCharacterRoutes = (app) => {
     if (characterError) {
       return handleSupabaseError(res, characterError);
     }
-    if (!includeSheet) {
-      return res.json(characters ?? []);
-    }
 
     const characterIds = (characters ?? []).map((character) => character.id);
     const sheetResult = await fetchCoc6Sheets({
@@ -98,10 +95,12 @@ export const registerBotCharacterRoutes = (app) => {
       return handleSupabaseError(res, sheetResult.error);
     }
 
-    const rows = (characters ?? []).map((character) => ({
-      ...character,
-      coc6_sheet: sheetResult.sheetsByCharacterId.get(character.id) ?? null
-    }));
+    const rows = (characters ?? []).map((character) =>
+      buildTypedCharacter(
+        character,
+        sheetResult.sheetsByCharacterId.get(character.id) ?? null
+      )
+    );
     return res.json(rows);
   });
 
@@ -111,7 +110,6 @@ export const registerBotCharacterRoutes = (app) => {
       return;
     }
 
-    const includeSheet = parseBoolean(req.query.include_sheet);
     const includePrivateSheet = parseBoolean(req.query.include_private_sheet);
     const userId = typeof req.query.user_id === "string" ? req.query.user_id : "";
 
@@ -130,9 +128,6 @@ export const registerBotCharacterRoutes = (app) => {
     if (userId && character.user_id !== userId) {
       return res.status(404).json({ error: "character not found" });
     }
-    if (!includeSheet) {
-      return res.json(character);
-    }
 
     let query = client
       .from("character_sheets_coc6")
@@ -146,17 +141,11 @@ export const registerBotCharacterRoutes = (app) => {
     const { data: sheet, error: sheetError } = await query.maybeSingle();
     if (sheetError) {
       if (sheetError.code === "42P01") {
-        return res.json({
-          ...character,
-          coc6_sheet: null
-        });
+        return res.json(buildTypedCharacter(character, null));
       }
       return handleSupabaseError(res, sheetError);
     }
 
-    return res.json({
-      ...character,
-      coc6_sheet: sheet ?? null
-    });
+    return res.json(buildTypedCharacter(character, sheet ?? null));
   });
 };
