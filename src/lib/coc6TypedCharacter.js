@@ -103,7 +103,7 @@ export const buildTypedCharacter = (character, sheet) => {
   const con = toNumber(attributes.CON, toNumber(paramsMap.get("CON"), 0));
   const siz = toNumber(attributes.SIZ, toNumber(paramsMap.get("SIZ"), 0));
   const pow = toNumber(attributes.POW, toNumber(paramsMap.get("POW"), 0));
-  const hpMaxByAttr = Math.floor((con + siz) / 2);
+  const hpMaxByAttr = Math.ceil((con + siz) / 2);
   const mpMaxByAttr = pow;
   const sanMaxByAttr = pow * 5;
 
